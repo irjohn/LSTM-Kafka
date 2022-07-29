@@ -1,0 +1,5 @@
+getopts
+TA-Lib
+sklearn
+keras
+tensorflow

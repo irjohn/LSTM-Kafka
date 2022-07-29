@@ -1,0 +1,718 @@
+# IMPORTS
+
+from Consumer import Consumer
+from Producer import Producer
+from database import Database
+from keras.models import load_model
+from datetime import datetime
+from layers.attention import Attention
+from metrics.fbeta import FBeta
+from funcs import find_model,train,get_model_attributes
+#import matplotlib.pyplot as plt
+import talib as ta
+import numpy as np
+import pandas as pd
+import logging
+import os
+#------------------------------------------------------------------->
+class ModelStream:
+	def __init__(self,symbol,streamer,filename=None,logpath=None,train=True,**kwargs):
+		self.symbol = symbol
+		self.streamer = streamer
+		self.producer = kwargs.get('producer',None)
+		self.train = train
+		
+		# RESOLUTION
+		self.resolution = kwargs.get('resolution','h')
+		self.resolutions = ['m','h','d']
+		if self.resolution[0].lower() in self.resolutions:
+			self.resolution = self.resolutions[self.resolutions.index(kwargs.get('resolution','h')[0].lower())]
+
+
+		# MODEL
+		if filename is not None:
+			self.filename = filename
+		else:
+			self.filename = find_model(symbol,self.resolution)
+		self.df,self.feature_dct = get_model_attributes(self.symbol,self.filename)
+		self.model = load_model(os.path.join('models',self.filename),custom_objects={'Attention':Attention,'FBeta':FBeta})
+		self.model.symbol = self.streamer.stream
+
+
+
+		# FEATURES
+		#self.feature_dct = feature_dct
+		self.features = self.feature_dct.get('all',[])
+		self.target = self.feature_dct.get('target',['move'])
+		self.n_features = len(self.features)
+
+		# TRAINING
+		self.batch_size = kwargs.get('batch_size',2)
+		self.epochs = kwargs.get('epochs',20)
+		self.maximize = kwargs.get('maximize','val_fbeta')
+
+
+		# PARAMS
+		self.n_lookback = self.model.layers[0].input_shape[1] # length of input sequences (timestep)
+		self.n_forecast = self.model.layers[-1].output_shape[-1]
+		self.parameters = get_model_attributes(self.symbol,self.filename,data_type='params')
+		self.parameters['timed'] = True
+		
+		# OVERRIDES
+		self.process_overrides(**kwargs)
+		
+
+		# SCALERS
+		self.standardScaler = None
+		self.maxabsScaler = None
+		self.minmaxScaler = None
+		
+		# MISC
+		self.sequence = 0
+		self.predictions = None
+		self.Megabyte = 1000000
+		if logpath:
+			log_format = "-------"*9 + "\n%(asctime)s %(levelname)s | %(message)s\n"
+			logging.basicConfig(level=logging.INFO,
+	        		            format=log_format,
+	                		    filename=logpath,
+	                    		filemode='w')
+		# INITIALIZE
+		self.scaler()
+		if self.train:
+			self.model = train(self.parameters,self.featureStore.iloc[:-1],threshold=0.9)
+		self.get_predictions()
+		np.warnings.filterwarnings('ignore', category=np.VisibleDeprecationWarning)
+		print('Model ready!')
+
+	def ingest(self):
+		print('Preparing to ingest')
+		"""
+		Messages in form: [<ID>,
+					       <timestamp>,
+					       <lastClose>,
+					       <open>,
+					       <high>,
+					       <low>,
+					       <close>,
+					       <volume>,
+					       <symbol>]
+		"""
+		self.msgCounter = 0
+		for data in self.streamer.consumer:
+			self.msgCounter += 1	
+			if len(data.value) == 9:
+				timestamp = datetime.fromtimestamp(data.value[1])
+				if timestamp == self.df.index[-1]:
+					self.process_df(data.value,**self.feature_dct['indicators'])
+				elif timestamp > self.df.index[-1]:
+					memoryFootprint = sum([sum(self.df.memory_usage(index=True,deep=True)),
+								           sum(self.predictions.memory_usage(index=True,deep=True)),
+										   sum(self.featureStore.memory_usage(index=True,deep=True))])/self.Megabyte
+					print(f'Message count: {self.msgCounter}')
+					print('----------'*10)
+					print(f'Memory footprint: {memoryFootprint:.2f} Megabytes')
+					print(f'Current DF timestamp: {self.df.index[-1]}')
+					print(f'Timestamp: {timestamp}')
+					print(data.value)
+					print('----------'*10)
+					self.scaler()
+					self.insert_row(data.value,**self.feature_dct['indicators'])
+					print('----------'*10)
+				else:
+					continue
+				if pd.notna(self.predictions.loc[self.predictions.index[-1],'actual']):
+					print('Time to make a prediction!')
+					self.predict()
+					if self.train:
+						self.model = train(self.parameters,self.featureStore,threshold=0.9)
+
+				
+	def process_df(self,data,**kwargs):
+		keys = ['id','ts','lastClose','open','high','low','close','volume','symbol']
+		data = {keys[i]:data[i] for i in range(len(keys))}
+		columns = self.uniques(self.features + keys)
+		ts = datetime.fromtimestamp(data['ts'])
+		#print(f'data timestamp: {ts}') # DEBUG
+		data = self.get_indicators(mode='process',data=data,**kwargs)
+		self.df.loc[ts,columns] = [data[column] for column in columns]
+		return self.df
+
+
+	def insert_row(self,data,**kwargs):
+		print('Appending row')
+		ID,ts,lastClose,Open,high,low,close,volume,symbol = data
+		columns = ['open','high','low','close','volume']
+		indicators = list(self.feature_dct['indicators'].keys())
+		ts = datetime.fromtimestamp(ts)
+		data = data[3:-1]
+		entry = {columns[i]:data[i] for i in range(len(columns))}
+		df2 = pd.DataFrame(entry,index=[ts])
+		df2.index.name = 'ts'
+		df2['move'] = 0
+		print(df2)
+		self.df.loc[self.df.index[-1],'move'] = 1 if self.df.loc[self.df.index[-1],'close'] - self.df.loc[self.df.index[-2],'close'] > 0 else 0 
+		self.predictions.loc[ts,'actual'] = 1 if self.df.loc[self.df.index[-1],'close'] - self.df.loc[self.df.index[-2],'close'] > 0 else 0
+		self.df = pd.concat([self.df,df2])
+		indicator_values = self.get_indicators(mode='insert',**kwargs)
+		#print(f'indicator list: {len(indicators)} | indicator_values: {len(indicator_values)}') # DEBUG
+		self.df.loc[ts,indicators] = indicator_values
+		self.sequence += 1
+		return self.df
+
+	def scaler(self):
+		# Make a copy of the data
+		self.featureStore = self.df.copy()
+		
+		# Fitting and transforming the scalers
+		if len(self.feature_dct['scaled']['standard']) > 0:
+			if self.standardScaler is None:
+				from sklearn.preprocessing import StandardScaler
+				self.standardScaler = StandardScaler().fit(self.df[self.feature_dct['scaled']['standard']])
+			self.featureStore[self.feature_dct['scaled']['standard']] = self.standardScaler.transform(self.df[self.feature_dct['scaled']['standard']])
+
+		if len(self.feature_dct['scaled']['minmax']) > 0:
+			if self.minmaxScaler is None:
+				from sklearn.preprocessing import MinMaxScaler
+				self.minmaxScaler = MinMaxScaler().fit(self.df[self.feature_dct['scaled']['minmax']])
+			self.featureStore[self.feature_dct['scaled']['minmax']] = self.minmaxScaler.transform(self.df[self.feature_dct['scaled']['minmax']])
+		
+		if len(self.feature_dct['scaled']['maxabs']) > 0:
+			if self.maxabsScaler is None:
+				from sklearn.preprocessing import MaxAbsScaler
+				self.maxabsScaler = MaxAbsScaler().fit(self.df[self.feature_dct['scaled']['maxabs']])
+			self.featureStore[self.feature_dct['scaled']['maxabs']] = self.maxabsScaler.transform(self.df[self.feature_dct['scaled']['maxabs']])
+				
+		
+		# Get digestable array
+		X_ = self.featureStore[self.features].iloc[-self.n_lookback:].values  # last available input sequence
+		self.X_ = X_.reshape(1, self.n_lookback, self.n_features)
+		return self.X_
+
+	def predict(self):
+		Y_ = self.model.predict(self.X_)[0][0]
+		print(Y_)
+		Y_ = 1 if Y_ > 0.55 else 0
+
+		predictions = pd.DataFrame(columns=['ts','actual', 'forecast'])
+		if self.resolution == 'm':
+			predictions['ts'] = pd.date_range(start=self.df.index[-1] + pd.Timedelta(minutes=1),
+												   periods=self.n_forecast,
+												   freq="T")
+		elif self.resolution == 'h':
+			predictions['ts'] = pd.date_range(start=self.df.index[-1] + pd.Timedelta(hours=1),
+												   periods=self.n_forecast,
+												   freq="H")
+		elif self.resolution == 'd':
+			predictions['ts'] = pd.date_range(start=self.df.index[-1] + pd.Timedelta(days=1),
+												   periods=self.n_forecast,
+												   freq="D")
+		predictions.set_index('ts', inplace=True)
+		predictions['forecast'] = Y_
+		predictions['actual'] = np.nan
+		self.insert_predictions()
+		self.predictions = pd.concat([self.predictions,predictions])
+		if self.producer is not None:
+			self.producer.send_prediction((datetime.timestamp(self.predictions.index[-1]),Y_))
+		print(self.predictions.tail())
+		return Y_
+
+	def get_predictions(self):
+		Y_ = self.model.predict(self.X_)[0][0]
+		print(Y_)
+		Y_ = 1 if Y_ > 0.55 else 0
+
+		self.predictions = pd.DataFrame(columns=['ts','actual', 'forecast'])
+		if self.resolution == 'm':
+			self.predictions['ts'] = pd.date_range(start=self.df.index[-1] + pd.Timedelta(minutes=1),
+												   periods=self.n_forecast,
+												   freq="T")
+		elif self.resolution == 'h':
+			self.predictions['ts'] = pd.date_range(start=self.df.index[-1] + pd.Timedelta(hours=1),
+												   periods=self.n_forecast,
+												   freq="H")
+		elif self.resolution == 'd':
+			self.predictions['ts'] = pd.date_range(start=self.df.index[-1] + pd.Timedelta(days=1),
+												   periods=self.n_forecast,
+												   freq="D")												   			
+		self.predictions.set_index('ts', inplace=True)
+		self.predictions['forecast'] = Y_
+		self.predictions['actual'] = np.nan
+		if self.producer is not None:
+			self.producer.send_prediction((datetime.timestamp(self.predictions.index[-1]),Y_))
+		print(self.predictions.tail())
+		return Y_
+
+
+	def insert_predictions(self,save=False):
+		ts = self.predictions.index[-1]
+		ID = self.resolution+str(int(datetime.timestamp(ts)))+str(self.symbol)
+		actual,pred = self.predictions.iloc[-1]
+		close = self.df.loc[self.df.index[-1],'close']
+		with Database() as db:
+			dt = (ID,ts,self.resolution,actual,pred,close,self.filename)
+			q = f'INSERT INTO predictions (id,ts,resolution,actual,prediction,close,filename) VALUES ({",".join(list(map(lambda x: "%s",dt)))})'
+			try:
+				db.execute(q,dt)
+			except Exception as e:
+				print(e)
+				logging.exception(e)
+				pass
+		if save:
+			self.predictions.to_csv(os.path.join('csv',f'{self.symbol}_preds.csv'),index=True)
+
+		
+	def get_indicators(self,mode='process',**kwargs):
+		indicators = []
+		if mode == 'process':
+			indicator_dct = kwargs['data']
+			
+		for key,period in kwargs.items():
+			key = key.lower()
+			if key.lower() == 'stddev':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = {}	
+				stddev = ta.STDDEV(self.df.close, timeperiod=kwargs[key].get('timeperiod',5), nbdev=kwargs[key].get('nbdev',2))
+				idx = len(stddev)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = stddev[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(stddev[idx])
+
+			if key.lower() == 'var':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = {}	
+				var = ta.VAR(self.df.close, timeperiod=kwargs[key].get('timeperiod',5), nbdev=kwargs[key].get('nbdev',2))
+				idx = len(var)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = var[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(var[idx])
+
+			if key.lower() == 'sma':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 20
+				sma = ta.SMA(self.df.close,timeperiod=kwargs[key])
+				idx = len(sma)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = sma[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(sma[idx])
+			elif 'sma' in key.lower():
+				if len(key) > 3:
+					period = int(key[3:])
+				sma = ta.SMA(self.df.close,timeperiod=period)
+				idx = len(sma)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = sma[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(sma[idx])
+
+			if key.lower() == 'ema':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 20
+				ema = ta.EMA(self.df.close,timeperiod=kwargs[key])
+				idx = len(ema)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = ema[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(ema[idx])
+			elif 'ema' in key.lower():
+				if len(key) > 3:
+					period = int(key[3:])
+				ema = ta.EMA(self.df.close,timeperiod=period)
+				idx = len(ema)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = ema[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(ema[idx])
+
+			if key.lower() == 'wma':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 20
+				wma = ta.WMA(self.df.close,timeperiod=kwargs[key])
+				idx = len(wma)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = wma[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(wma[idx])
+			elif 'wma' in key.lower():
+				if len(key) > 3:
+					period = int(key[3:])
+				wma = ta.WMA(self.df.close,timeperiod=period)
+				idx = len(wma)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = wma[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(wma[idx])
+
+			if key.lower() == 'vma':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = {}	
+				vma = ta.MAVP(self.df.close.values,self.df.close.values,minperiod=kwargs[key].get('minperiod',20),
+																		maxperiod=kwargs[key].get('maxperiod',200),
+																		matype=0)
+				idx = len(vma)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = vma[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(vma[idx])
+
+			if key.lower() == 'trima':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 20
+				trima = ta.SMA(self.df.close, timeperiod=kwargs[key])
+				trima = trima.rolling(kwargs[key]).mean()
+				idx = len(trima)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = trima[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(trima[idx])
+			elif 'trima' in key.lower():
+				if len(key) > 5:
+					period = int(key[5:])
+				trima = ta.SMA(self.df.close,timeperiod=period)
+				trima = trima.rolling(period).mean()
+				idx = len(trima)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = trima[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(trima[idx])
+
+			if key.lower() == 'tma':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 20
+				tma = ta.TRIMA(self.df.close, timeperiod=kwargs[key])
+				idx = len(tma)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = tma[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(tma[idx])		
+			elif 'tma' in key.lower():
+				if len(key) > 3:
+					period = int(key[3:])
+				tma = ta.TRIMA(self.df.close,timeperiod=period)
+				idx = len(tma)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = tma[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(tma[idx])
+
+
+			if key.lower() == 'rsi':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 14
+				rsi = ta.RSI(self.df.close,timeperiod=kwargs[key])
+				idx = len(rsi)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = rsi[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(rsi[idx])
+
+			if key.lower() == 'roc':
+				if type(kwargs['roc']) == bool:
+					kwargs['roc'] = 14
+				roc = ta.ROC(self.df.close,timeperiod=kwargs['roc'])
+				idx = len(roc)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = roc[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(roc[idx])
+
+			if key.lower() == 'rocp':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 14
+				rocp = ta.ROCP(self.df.close,timeperiod=kwargs[key])
+				idx = len(rocp)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = rocp[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(rocp[idx])
+
+			if key.lower() == 'bbands':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = {}
+				upper,middle,lower = ta.BBANDS(self.df.close,timeperiod=kwargs[key].get('timeperiod',14),
+															 nbdevup=kwargs[key].get('nbdevup',2),
+															 nbdevdn=kwargs[key].get('nbdevdown',2),
+															 matype=0)
+				idx = len(middle)-1
+				if mode.lower() == 'process':
+					indicator_dct['upper'] = upper[idx]
+					indicator_dct['middle'] = middle[idx]
+					indicator_dct['lower'] = lower[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(upper[idx])
+					indicators.append(middle[idx])
+					indicators.append(lower[idx])
+
+			if key.lower() == 'bbp':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = {}
+				upper,middle,lower = ta.BBANDS(self.df.close,timeperiod=kwargs[key].get('timeperiod',14),
+														nbdevup=kwargs[key].get('nbdevup',2),
+														nbdevdn=kwargs[key].get('nvdevdown',2),
+														matype=0)
+				bbp = (self.df.close-lower)/(upper-lower)
+				idx = len(bbp)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = bbp[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(bbp[idx])
+
+			if key.lower() == 'atr':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 14
+				atr = ta.ATR(self.df.high,self.df.low,self.df.close,timeperiod=kwargs[key])
+				idx = len(atr)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = atr[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(atr[idx])
+
+			if key.lower() == 'natr':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 14
+				natr = ta.NATR(self.df.high,self.df.low,self.df.close,timeperiod=kwargs[key])
+				idx = len(natr)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = natr[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(natr[idx])
+
+			if key.lower() == 'trange':
+				trange = ta.TRANGE(self.df.high,self.df.low,self.df.close)
+				idx = len(trange)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = trange[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(trange[idx])
+
+			if key.lower() == 'apo':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = {}
+				apo = ta.APO(self.df.close, fastperiod=kwargs[key].get('fastperiod',10),
+									   slowperiod=kwargs[key].get('slowperiod',26),
+									   matype=ta.MA_Type.EMA)
+				idx = len(apo)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = apo[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(apo[idx])
+
+			if key.lower() == 'ppo':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = {}
+				ppo = ta.PPO(self.df.close, fastperiod=kwargs[key].get('fastperiod',26),
+									   slowperiod=kwargs[key].get('slowperiod',10),
+									   matype=ta.MA_Type.EMA)
+				ppo_signal = ta.EMA(ppo,kwargs[key].get('signal',9))
+				ppo_hist = ppo-ppo_signal
+				idx = len(ppo)-1
+				if mode.lower() == 'process':
+					indicator_dct['ppo'] = ppo[idx]
+					indicator_dct['ppo_signal'] = ppo_signal[idx]
+					indicator_dct['ppo_hist'] = ppo_hist[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(ppo[idx])
+					indicators.append(ppo_signal[idx])
+					indicators.append(ppo_hist[idx])
+
+			if key.lower() == 'obv':
+				obv = ta.OBV(self.df.close,self.df.volume)
+				idx = len(obv)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = obv[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(obv[idx])
+
+			if key.lower() == 'adosc':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = {}	
+				adosc = ta.ADOSC(self.df.high, self.df.low, self.df.close, self.df.volume, fastperiod=kwargs[key].get('fastperiod',3), slowperiod=kwargs[key].get('slowperiod',10))
+				idx = len(adosc)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = adosc[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(adosc[idx])
+
+			if key.lower() == 'trend':
+				trend = ta.HT_TRENDMODE(self.df.close)
+				idx = len(trend)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = trend[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(trend[idx])
+
+			if key.lower() == 'adx':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 14
+				adx = ta.ADX(self.df.high, self.df.low, self.df.close, timeperiod=kwargs[key])
+				idx = len(adx)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = adx[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(adx[idx])
+
+
+			if key.lower() == 'adxr':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 14
+				adxr = ta.ADXR(self.df.high, self.df.low, self.df.close, timeperiod=kwargs[key])
+				idx = len(adxr)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = adxr[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(adxr[idx])
+
+			if key.lower() == 'bop':
+				bop = ta.BOP(self.df.open, self.df.high, self.df.low, self.df.close)
+				idx = len(bop)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = bop[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(bop[idx])
+
+			if key.lower() == 'cci':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 14
+				cci = ta.CCI(self.df.high, self.df.low, self.df.close, timeperiod=kwargs[key])
+				idx = len(cci)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = cci[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(cci[idx])
+
+			if key.lower() == 'mfi':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 14
+				mfi = ta.MFI(self.df.high, self.df.low, self.df.close, self.df.volume, timeperiod=kwargs[key])
+				idx = len(mfi)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = mfi[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(mfi[idx])
+
+			if key.lower() == 'uo':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = {}
+				uo = ta.ULTOSC(self.df.high, self.df.low, self.df.close, timeperiod1=kwargs[key].get('timeperiod1',7),
+														  				 timeperiod2=kwargs[key].get('timeperiod2',14),
+														  				 timeperiod3=kwargs[key].get('timeperiod3',28))
+				idx = len(uo)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = uo[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(uo[idx])
+
+			if key.lower() == 'willr':
+				if type(kwargs[key]) == bool:
+					kwargs[key] = 14
+				willr = ta.WILLR(self.df.high,self.df.low,self.df.close,timeperiod=kwargs[key])
+				idx = len(willr)-1
+				if mode.lower() == 'process':
+					indicator_dct[key] = willr[idx]
+				elif mode.lower() == 'insert':
+					indicators.append(willr[idx])
+		
+		if mode.lower() == 'process':
+			return indicator_dct
+		elif mode.lower() == 'insert':
+			return indicators
+
+	def process_overrides(self,**kwargs):
+		for key in kwargs:
+			if key.lower() == 'maximize':
+				possible_values = ['loss','val_loss',
+								   'Accuracy','val_Accuracy',
+								   'precision','val_precision',
+								   'recall','val_recall',
+								   'auc','val_auc'
+								   'fbeta','val_fbeta']
+				if kwargs[key] not in possible_values:
+					raise ValueError(f'Must be one of: {possible_values}')
+				else:
+					self.parameters[key] = kwargs[key]
+			elif key.lower() == 'features':
+				self.parameters[key] = kwargs[key]
+			elif key.lower() == 'feature_dct':
+				self.parameters[key] = kwargs[key]
+			elif key.lower() == 'target':
+				self.parameters[key] = kwargs[key]
+			elif key.lower() == 'batch_size':
+				if type(kwargs[key]) != int:
+					raise TypeError('Must be an integer')
+				else:
+					self.parameters[key] = kwargs[key]
+			elif key.lower() == 'epochs':
+				if type(kwargs[key]) != int:
+					raise TypeError('Must be an integer')
+				else:
+					self.parameters[key] = kwargs[key]
+			elif key.lower() == 'n_lookback':
+				if type(kwargs[key]) != int:
+					raise TypeError('Must be an integer')
+				else:
+					self.parameters[key] = kwargs[key]
+			elif key.lower() == 'n_forecast':
+				if type(kwargs[key]) != int:
+					raise TypeError('Must be an integer')
+				else:
+					self.parameters[key] = kwargs[key]
+			elif key.lower() == 'n_features':
+				if type(kwargs[key]) != int:
+					raise TypeError('Must be an integer')
+				else:
+					self.parameters[key] = kwargs[key]
+			elif key.lower() == 'n_neurons':
+				if type(kwargs[key]) != int:
+					raise TypeError('Must be an integer')
+				else:
+					self.parameters[key] = kwargs[key]
+			elif key.lower() == 'dropout':
+				self.parameters[key] = kwargs[key]
+			elif key.lower() == 'timed':
+				if type(kwargs[key]) != bool:
+					raise TypeError('Must be a True/False value')
+				self.parameters[key] = kwargs[key]
+			elif key.lower() == 'train_type':
+				if kwargs[key].lower() == 'train' or kwargs[key].lower() == 'stream':
+					self.parameters[key] = kwargs[key].lower()
+				else:
+					raise ValueError('train_type parameters must be either "train" or "stream"')
+				
+
+	def uniques(cls,*args):
+		returns = set()
+		for item in args:
+			if type(item) == list or type(item) == tuple:
+				for e in item:
+					returns.add(e)
+			else:
+				returns.add(e)
+		return list(returns)
+		
+#---------------------------------------------------------------------->						
+# INITIALIZE
+
+if __name__ == '__main__':
+	
+	symbol = 'sETHUSDT'
+	resolution = 'm'
+	logpath = os.path.join('log','model.log')
+
+
+#---------------------------------------------------------------------->
+# STREAM
+
+	servers = ['192.168.0.156:9092']
+	Streamer = Consumer(servers,symbol,resolution=resolution)
+	Producer = Producer(servers,symbol,resolution=resolution)
+	Model = ModelStream(symbol,
+					    Streamer,
+						resolution=resolution,
+						logpath=logpath,
+						producer=Producer,
+						train=False
+	)
+	Model.ingest()
