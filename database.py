@@ -234,20 +234,11 @@ class Database():
 		return df.dropna()
 
 	def get_indicators(self,df,kwargs):
+		self.moving_averages = ['sma','ema','wma','tma','trima']
 		for key,value in kwargs.items():
 			key = key.lower()
 			if key == 'diff':
-				if type(kwargs[key]) == list:
-					moving_averages = ['sma','ema','wma','tma','trima']
-					import re
-					period_regex = re.compile('[0-9]+')
-					name_regex = re.compile('[a-zA-Z]+')
-					for item in kwargs[key]:
-						period = period_regex.findall(item)[:]
-						name = name_regex.findall(item)[:]
-						
-				else:
-					raise ValueError("Must be a list of indicator names to find the difference of.")
+				df = self.compute_differences(df,key,value)
 
 			if key == 'stddev':
 				if type(kwargs[key]) == bool:
@@ -510,6 +501,48 @@ class Database():
 		df = df.assign(kst=kst,
 					   kst_signal=kst_signal)
 		return df
+
+	def compute_differences(self,df,key,lst):
+		if type(lst) == list:
+			moving_averages = ['sma','ema','wma','tma','trima']
+			values = []
+			min_period = np.Inf
+			import re
+			period_regex = re.compile('[0-9]+')
+			name_regex = re.compile('[a-zA-Z]+')
+			for item in lst:
+				period = period_regex.findall(item)
+				name = name_regex.findall(item)
+				if name and period:
+					name,period = name[0],int(period[0])
+					if name not in self.moving_averages:
+						raise ValueError("Must be a pair of moving averages to find the difference of in the form of '<name><period>' i.e. 'sma12'")
+					if period < min_period:
+						min_period = period
+				if name == 'sma':
+					value = ta.SMA(df.close,timeperiod=period)
+				elif name == 'ema':
+					value = ta.EMA(df.close,timeperiod=period)
+				elif name == 'wma':
+					value = ta.WMA(df.close,timeperiod=period)
+				elif name == 'tma':
+					value = ta.TRIMA(df.close,timeperiod=period)
+				elif name == 'trima':
+					value = ta.SMA(df.close,timeperiod=period)
+					value = value.rolling(period).mean()
+				container = [period,value]
+				values.append(container)
+			for lst in values:
+				if lst[0] == min_period:
+					idx = values.index(lst)
+			if idx == 0:
+				diff = values[0][1]-values[1][1]
+			elif idx == 1:
+				diff = values[1][1]-values[0][1]
+			df['diff'] = diff
+			return df				
+		else:
+			raise ValueError("Must be a pair of moving averages to find the difference of in the form of '<name><period>' i.e. 'sma12'")
 
 #---------------------------------------- End ------------------------------------------->
 

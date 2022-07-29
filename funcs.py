@@ -45,30 +45,32 @@ def get_feature_generator(features):
 
 
 
-def scale(df,features,inplace=True):
+def scale(df,features):
 	standard = features['scaled'].get('standard',[])
 	minmax = features['scaled'].get('minmax',[])
 	maxabs = features['scaled'].get('maxabs',[])
 	scalers = {'standard':None,'minmax':None,'maxabs':None}
-	if inplace:
-		if len(standard) > 0:
-			from sklearn.preprocessing import StandardScaler
-			standardScaler = StandardScaler().fit(df[features['scaled']['standard']])
-			df[features['scaled']['standard']] = standardScaler.transform(df[features['scaled']['standard']])
-			scalers['standard'] = standardScaler
-			
-		if len(minmax) > 0:
-			from sklearn.preprocessing import MinMaxScaler
-			minmaxScaler = MinMaxScaler().fit(df[features['scaled']['minmax']])
-			df[features['scaled']['minmax']] = minmaxScaler.transform(df[features['scaled']['minmax']])
-			scalers['minmax'] = minmaxScaler
+	if 'diff' in features['indicators']:
+		minmax.append('diff')
 
-		if len(maxabs) > 0:
-			from sklearn.preprocessing import MaxAbsScaler
-			maxabsScaler = MaxAbsScaler().fit(df[features['scaled']['maxabs']])
-			df[features['scaled']['maxabs']] = maxabsScaler.transform(df[features['scaled']['maxabs']])
-			scalers['maxabs'] = maxabsScaler
-		return df,scalers
+	if standard:
+		from sklearn.preprocessing import StandardScaler
+		standardScaler = StandardScaler().fit(df[features['scaled']['standard']])
+		df[features['scaled']['standard']] = standardScaler.transform(df[features['scaled']['standard']])
+		scalers['standard'] = standardScaler
+		
+	if minmax:
+		from sklearn.preprocessing import MinMaxScaler
+		minmaxScaler = MinMaxScaler().fit(df[features['scaled']['minmax']])
+		df[features['scaled']['minmax']] = minmaxScaler.transform(df[features['scaled']['minmax']])
+		scalers['minmax'] = minmaxScaler
+
+	if maxabs:
+		from sklearn.preprocessing import MaxAbsScaler
+		maxabsScaler = MaxAbsScaler().fit(df[features['scaled']['maxabs']])
+		df[features['scaled']['maxabs']] = maxabsScaler.transform(df[features['scaled']['maxabs']])
+		scalers['maxabs'] = maxabsScaler
+	return df,scalers
 
 
 def get_model_attributes(symbol,filename,data_type='df',**kwargs):
